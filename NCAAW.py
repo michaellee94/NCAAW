@@ -235,7 +235,7 @@ def cleanexistingties(teamsin, gamesin):
 		game.awayteam.games.add(game)
 	return teams, games
 
-def cleanaftertime(time, teamsin, gamesin):
+def cleanbeforetime(time, teamsin, gamesin):
 	teams = {team.teamid: Team(team.teamid, team.longname, shortname=team.shortname, isd1=team.isd1, conference=team.conference) for team in teamsin.values()}
 	games = {game.gameid: Game(game.gameid, game.time, teams[game.hometeam.teamid], game.homescore, teams[game.awayteam.teamid], game.awayscore) for game in gamesin.values() if game.time >= time}
 	for game in list(games.values()):
