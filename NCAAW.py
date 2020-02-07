@@ -1,4 +1,4 @@
-import requests, json, datetime as dt, itertools, copy, pickle, math, scipy
+import asyncio, aiohttp, async_timeout, json, datetime as dt, itertools, copy, pickle, math, scipy
 from bs4 import BeautifulSoup
 from time import strptime
 from statistics import mean
@@ -84,76 +84,6 @@ class Team:
 	
 	def RPI(self):
 		return 0.25*self.D1winpct()+0.5*self.OWP()+0.25*self.OOWP()
-	
-	def getgames(self, teamsin, gamesin):
-		teams = dict(teamsin)
-		games = dict(gamesin)
-		schedulesoup = BeautifulSoup(requests.get('https://www.espn.com/womens-college-basketball/team/schedule/_/id/'+str(self.teamid)).text, 'html5lib').html.body.script
-		schedulejson = json.loads(schedulesoup.text[23:-1])['page']['content']['scheduleData']
-		self.shortname = schedulejson['team']['abbrev']
-		gamesjson = list(itertools.chain.from_iterable([schedule['events']['post'] for schedule in schedulejson['teamSchedule']]))
-		for gamejson in gamesjson:
-			gameid = int(gamejson['time']['link'].split('=')[1])
-			if gameid not in [game.gameid for game in self.games]:
-				datetime = dt.datetime.strptime(gamejson['date']['date'], '%Y-%m-%dT%H:%MZ').replace(tzinfo=dt.timezone.utc)
-				
-				opponentjson = gamejson['opponent']
-				opponentid = int(opponentjson['id'])
-				if opponentid not in teams:
-					try:
-						opponentshortname = opponentjson['abbrev']
-					except KeyError:
-						opponentshortname = None	
-					opponent = Team(opponentid, opponentjson['displayName'], shortname=opponentshortname)
-					teams[opponentid] = opponent
-				else:
-					opponent = teams[opponentid]
-				vsat = opponentjson['homeAwaySymbol']
-				neutralsite = opponentjson['neutralSite']
-				
-				result = gamejson['result']
-				teamscore = int(result['currentTeamScore'])
-				opponentscore = int(result['opponentTeamScore'])
-				
-				try:
-					overtime = result['overtime']
-					if overtime == 'OT':
-						ots = 1
-					else:
-						ots = int(overtime[:-2])
-				except KeyError:
-					ots = 0
-	
-				if vsat == 'vs':
-					if neutralsite:
-						gameteams = sorted([[self, teamscore], [opponent, opponentscore]], key=lambda x: x[0].teamid)
-						hometeam = gameteams[0][0]
-						homescore = gameteams[0][1]
-						awayteam = gameteams[1][0]
-						awayscore = gameteams[1][1]
-						game = Game(gameid, datetime, hometeam, homescore, awayteam, awayscore, ots=ots)
-						games[gameid] = game
-						self.games.add(game)
-						opponent.games.add(game)
-					else:
-						hometeam = self
-						homescore = teamscore
-						awayteam = opponent
-						awayscore = opponentscore
-						game = Game(gameid, datetime, hometeam, homescore, awayteam, awayscore, ots=ots)
-						games[gameid] = game
-						self.games.add(game)
-						opponent.games.add(game)
-				elif vsat == '@':
-					hometeam = opponent
-					homescore = opponentscore
-					awayteam = self
-					awayscore = teamscore
-					game = Game(gameid, datetime, hometeam, homescore, awayteam, awayscore, ots=ots)
-					games[gameid] = game
-					self.games.add(game)
-					opponent.games.add(game)
-		return teams, games
 
 
 class Game:
@@ -200,9 +130,11 @@ def recalldata(savefile):
 	return recallteams, recallgames
 
 
-def getD1teams():
+async def getD1teams(session):
 	teams = dict()
-	teamsoup = BeautifulSoup(requests.get('https://www.espn.com/womens-college-basketball/teams').text, 'html5lib').html.body.script
+	async with session.get('https://www.espn.com/womens-college-basketball/teams') as resp:
+		html = await resp.text()
+		teamsoup = BeautifulSoup(html, 'html5lib').html.body.script
 	columns = json.loads(teamsoup.text[23:-1])['page']['content']['leagueTeams']['columns']
 	for column in columns:
 		groups = column['groups']
@@ -216,14 +148,100 @@ def getD1teams():
 				teams[teamid] = team
 	return teams
 
+async def dictyieldvalues(dictionary):
+	for i in dictionary.values():
+		yield i
 
-def getD1teamsgames(savefile=None):
-	teams = getD1teams()
+async def getD1teamschedulejson(teamid, session):
+	#print('getting '+str(teamid))
+	schedulejson = None
+	while not schedulejson:
+		async with session.get('https://www.espn.com/womens-college-basketball/team/schedule/_/id/'+str(teamid)) as resp:
+			try:
+				with async_timeout.timeout(5.0):
+					html = await asyncio.wait_for(resp.text(), timeout=5.0)
+			except asyncio.TimeoutError:
+				#print('still waiting for '+str(teamid)+', restarting')
+				continue
+			try:
+				schedulesoup = BeautifulSoup(html, 'html5lib').html.body.script
+				schedulejson = json.loads(schedulesoup.text[23:-1])['page']['content']['scheduleData']
+			except json.decoder.JSONDecodeError:
+				#print('problem with '+str(teamid))
+				pass
+	#print('done getting '+str(teamid))
+	return teamid, schedulejson
+
+def processschedulejson(teams, team, schedulejson):
 	games = dict()
-	for team in list(teams.values()):
-		teams, games = team.getgames(teams, games)
-	if savefile:
-		savedata(teams, games, savefile)
+	team.shortname = schedulejson['team']['abbrev']
+	gamesjson = list(itertools.chain.from_iterable([schedule['events']['post'] for schedule in schedulejson['teamSchedule']]))
+	for gamejson in gamesjson:
+		gameid = int(gamejson['time']['link'].split('=')[1])
+		datetime = dt.datetime.strptime(gamejson['date']['date'], '%Y-%m-%dT%H:%MZ').replace(tzinfo=dt.timezone.utc)
+		
+		opponentjson = gamejson['opponent']
+		opponentid = int(opponentjson['id'])
+		if opponentid not in teams:
+			try:
+				opponentshortname = opponentjson['abbrev']
+			except KeyError:
+				opponentshortname = None	
+			opponent = Team(opponentid, opponentjson['displayName'], shortname=opponentshortname)
+			teams[opponentid] = opponent
+		else:
+			opponent = teams[opponentid]
+		vsat = opponentjson['homeAwaySymbol']
+		neutralsite = opponentjson['neutralSite']
+		
+		result = gamejson['result']
+		teamscore = int(result['currentTeamScore'])
+		opponentscore = int(result['opponentTeamScore'])
+		
+		try:
+			overtime = result['overtime']
+			if overtime == 'OT':
+				ots = 1
+			else:
+				ots = int(overtime[:-2])
+		except KeyError:
+			ots = 0
+
+		if vsat == 'vs':
+			if neutralsite:
+				gameteams = sorted([[team, teamscore], [opponent, opponentscore]], key=lambda x: x[0].teamid)
+				hometeam = gameteams[0][0]
+				homescore = gameteams[0][1]
+				awayteam = gameteams[1][0]
+				awayscore = gameteams[1][1]
+				game = Game(gameid, datetime, hometeam, homescore, awayteam, awayscore, ots=ots)
+				games[gameid] = game
+			else:
+				hometeam = team
+				homescore = teamscore
+				awayteam = opponent
+				awayscore = opponentscore
+				game = Game(gameid, datetime, hometeam, homescore, awayteam, awayscore, ots=ots)
+				games[gameid] = game
+		elif vsat == '@':
+			hometeam = opponent
+			homescore = opponentscore
+			awayteam = team
+			awayscore = teamscore
+			game = Game(gameid, datetime, hometeam, homescore, awayteam, awayscore, ots=ots)
+			games[gameid] = game
+	return games
+
+async def getD1teamsgames(savefile=None):
+	async with aiohttp.ClientSession() as session:
+		teams = await getD1teams(session)
+		schedulejsons = await asyncio.gather(*[getD1teamschedulejson(team.teamid, session) async for team in dictyieldvalues(teams)])
+	games = dict()
+	for teamid, schedulejson in schedulejsons:
+		games.update(processschedulejson(teams, teams[teamid], schedulejson))
+	for game in games.values():
+		game.hometeam.games.add(game)
+		game.awayteam.games.add(game)
 	return teams, games
 
 #KRACH rankings
