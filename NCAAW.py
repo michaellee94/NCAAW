@@ -1,5 +1,5 @@
-import asyncio, aiohttp, async_timeout, json, datetime as dt, itertools, copy, pickle, math, scipy
-from bs4 import BeautifulSoup
+import asyncio, aiohttp, async_timeout, lxml, json, datetime as dt, itertools, copy, pickle, math, scipy
+from bs4 import BeautifulSoup, SoupStrainer
 from time import strptime
 from statistics import mean
 from scipy.stats.mstats import gmean
@@ -134,7 +134,7 @@ async def getD1teams(session):
 	teams = dict()
 	async with session.get('https://www.espn.com/womens-college-basketball/teams') as resp:
 		html = await resp.text()
-		teamsoup = BeautifulSoup(html, 'html5lib').html.body.script
+		teamsoup = BeautifulSoup(html, 'lxml', parse_only=SoupStrainer(text=lambda string: string.startswith("window['__espnfitt__']")))
 	columns = json.loads(teamsoup.text[23:-1])['page']['content']['leagueTeams']['columns']
 	for column in columns:
 		groups = column['groups']
@@ -164,7 +164,7 @@ async def getD1teamschedulejson(teamid, session):
 				#print('still waiting for '+str(teamid)+', restarting')
 				continue
 			try:
-				schedulesoup = BeautifulSoup(html, 'html5lib').html.body.script
+				schedulesoup = BeautifulSoup(html, 'lxml', parse_only=SoupStrainer(text=lambda string: string.startswith("window['__espnfitt__']")))
 				schedulejson = json.loads(schedulesoup.text[23:-1])['page']['content']['scheduleData']
 			except json.decoder.JSONDecodeError:
 				#print('problem with '+str(teamid))
@@ -275,6 +275,9 @@ def numplayed(team1, team2):
 def sos(krachratings, team):
 	return gmean([krachratings[team.opponent(game).teamid] for game in team.games if team.opponent(game).isd1])
 
+def oocsos(krachratings, team):
+	return gmean([krachratings[team.opponent(game).teamid] for game in team.games if team.opponent(game).isd1 and team.opponent(game).conference != team.conference])
+
 '''def sos(krachratings, team):
 	return sum(krachratings[opponent.teamid]*numplayed(team, opponent)/(krachratings[opponent.teamid]+krachratings[team.teamid]) for opponent in team.D1opponents())/sum(numplayed(team, opponent)/(krachratings[opponent.teamid]+krachratings[team.teamid]) for opponent in team.D1opponents())'''
 
@@ -300,7 +303,7 @@ def calckrachratings(teamsin, gamesin, vpalpha=5, goaldelta=1e-10, time=None, si
 	if time:
 		teams, games = cleanaftertime(time, teams, games)
 	if sincetime:
-		teams, games = cleanbeforetime(time, teams, games)
+		teams, games = cleanbeforetime(sincetime, teams, games)
 	D1teams = {team.teamid: team for team in teams.values() if team.isd1}
 	
 	krachratings = {teamid: 100. for teamid, team in D1teams.items() if team.isd1}
